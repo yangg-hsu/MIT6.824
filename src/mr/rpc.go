@@ -8,11 +8,40 @@ package mr
 
 import "os"
 import "strconv"
+import "time"
 
 //
 // example to show how to declare the arguments
 // and reply for an RPC.
 //
+
+type TaskInfo struct {
+	TaskType int
+	TaskId int
+	NReduce int
+
+	TaskStartTime time.Time
+	Fname string
+	BackUpTask bool
+}
+
+type Response struct {  // send this struct to coordinator when finishing task
+	TaskType int
+	TaskId int
+}
+
+const (
+	DMapTask int = 1
+	DReduceTask = 2
+	DWaitTask = 3
+	DEndTask = 4
+)
+
+
+type MapTaskResultInfo struct {
+
+}
+
 
 type ExampleArgs struct {
 	X int

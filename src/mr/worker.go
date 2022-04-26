@@ -1,10 +1,17 @@
 package mr
 
-import "fmt"
-import "log"
-import "net/rpc"
-import "hash/fnv"
+import (
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"io/ioutil"
+	"log"
+	"net/rpc"
+	"os"
+	"regexp"
+	"sort"
 
+)
 
 //
 // Map functions return a slice of KeyValue.
@@ -13,6 +20,13 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+
+
+type ByKey []KeyValue
 
 //
 // use ihash(key) % NReduce to choose the reduce
@@ -24,7 +38,6 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
-
 //
 // main/mrworker.go calls this function.
 //
@@ -32,10 +45,147 @@ func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
 	// Your worker implementation here.
+	for {
+		task := CallDistributeTask()
+		if task == nil {
+			continue
+		}
+		switch task.TaskType {
+		case DMapTask:
+			ret := HandleMapTask(mapf, task)
+			if ret {
+				resp := Response{DMapTask, task.TaskId}
+				CallTaskDone(&resp)
+			}
+		case DReduceTask:
+			ret := HandleReduceTask(reducef, task)
+			if ret {
+				resp := Response{DReduceTask, task.TaskId}
+				CallTaskDone(&resp)
+			}
+		case DWaitTask:
+			continue
+		case DEndTask:
+			os.Exit(0)
+		}
+	}
 
-	// uncomment to send the Example RPC to the coordinator.
-	// CallExample()
+}
 
+func HandleMapTask(mapf func(string, string) []KeyValue, task *TaskInfo) bool {
+
+	fname := task.Fname
+
+	file, err := os.Open(fname)
+	if err != nil {
+		log.Fatalf("cannot open %v", fname)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", fname)
+	}
+	file.Close()
+	kva := mapf(fname, string(content))
+
+	var files []*os.File
+	var encs []*json.Encoder
+
+	for i := 0; i < task.NReduce; i++ {
+
+		f, _ := ioutil.TempFile("", "intermediate")
+		files = append(files, f)
+		encs = append(encs, json.NewEncoder(f))
+	}
+
+	for _, kv := range kva {
+		encs[ihash(kv.Key)%10].Encode(&kv)
+	}
+
+	for i := 0; i < task.NReduce; i++ {
+		filename := fmt.Sprintf("mr-%v-%v", task.TaskId, i)
+		os.Rename(files[i].Name(), filename)
+		files[i].Close()
+	}
+	return true
+}
+
+func HandleReduceTask(reducef func(string, []string) string, task *TaskInfo) bool {
+
+	s := fmt.Sprintf("mr-\\d+-%v", task.TaskId)
+	pwd, _ := os.Getwd()
+	files, _ := ioutil.ReadDir(pwd)
+
+	intermediate := []KeyValue{}
+	for _, file := range files {
+		if match, _ := regexp.MatchString(s, file.Name()); match {
+			file, err := os.OpenFile(file.Name(), os.O_RDONLY, 0444)
+			if err != nil {
+				log.Fatalln("file open err: ", file.Name())
+			}
+			dec := json.NewDecoder(file)
+			for {
+				var kv KeyValue
+				if err := dec.Decode(&kv); err != nil {
+					break
+				}
+				intermediate = append(intermediate, kv)
+			}
+		}
+	}
+
+
+	sort.Sort(ByKey(intermediate))
+
+	oname := fmt.Sprintf("mr-out-%v", task.TaskId)
+	ofile, _ := os.Create(oname)
+
+	//
+	// call Reduce on each distinct key in intermediate[],
+	// and print the result to mr-out-0.
+	//
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// this is the correct format for each line of Reduce output.
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+
+	return true
+}
+
+
+func CallTaskDone(resp *Response) bool {
+	var otioseReply int
+	ok := call("Coordinator.TaskDone", resp, &otioseReply)
+	return ok
+}
+
+
+func CallDistributeTask() *TaskInfo {
+
+	var otioseArgs int
+
+	reply := TaskInfo{}
+	ok := call("Coordinator.DistributeTask", &otioseArgs, &reply)
+
+	if ok {
+		return &reply
+	}
+
+	return nil
 }
 
 //
